@@ -7,7 +7,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
-from scanner import scan_token
+from scanner import scan_token, get_dev_alpha
 from watchlist import add_to_watchlist, remove_from_watchlist, get_watchlist, check_watchlist_alerts
 from invites import generate_invite, use_invite, is_authorized, authorize_user, list_invites
 
@@ -73,7 +73,8 @@ async def send_welcome(update: Update, name: str):
         "• Supply concentration\n"
         "• MEV bot exposure\n\n"
         "*Commands:*\n"
-        "/scan `<CA>` — Scan a token\n"
+        "/scan `<CA>` — Full risk scan\n"
+        "/dev `<CA>` — Dev history & alpha\n"
         "/watch `<CA>` — Add to watchlist\n"
         "/unwatch `<CA>` — Remove from watchlist\n"
         "/watchlist — View your watchlist\n\n"
@@ -172,8 +173,30 @@ def format_report(ca: str, r: dict) -> str:
     elif score <= 60: verdict = "🟡 MEDIUM RISK"
     elif score <= 80: verdict = "🟠 HIGH RISK"
     else:             verdict = "🔴 CRITICAL RISK"
-    return "\n".join([
-        f"👁 *CHAIN SENTINEL REPORT*", f"`{ca}`", f"",
+
+    def fmt_mc(mc):
+        try:
+            mc = float(mc)
+            if mc >= 1_000_000: return f"${mc/1_000_000:.2f}M"
+            elif mc >= 1_000:   return f"${mc/1_000:.1f}K"
+            else:               return f"${mc:.0f}"
+        except: return "N/A"
+
+    # Build dev section
+    dev = r.get("dev", {})
+    deployer = dev.get("deployer", "N/A")
+    dev_short = f"`{deployer[:8]}...{deployer[-4:]}`" if deployer and deployer != "N/A" else "`N/A`"
+    dev_risk = dev.get("risk", "N/A")
+    dev_note = dev.get("risk_note", "")
+    token_count = dev.get("token_count", 0)
+    dead_count = dev.get("dead_count", 0)
+    biggest_mc = dev.get("biggest_mc", 0)
+    token_lines = dev.get("token_lines", [])
+    dev_summary = dev.get("summary", "No dev history found.")
+
+    lines = [
+        f"👁 *CHAIN SENTINEL REPORT*",
+        f"`{ca}`", f"",
         f"*Risk Score: {score}/100 — {verdict}*", f"",
         f"━━━ 💼 WALLET ANALYSIS ━━━",
         f"• Unique wallets: `{r.get('wallet_count', 'N/A')}`",
@@ -193,10 +216,26 @@ def format_report(ca: str, r: dict) -> str:
         f"• Suspected bot wallets: `{r.get('mev_bots', 'N/A')}`",
         f"• Sandwich patterns: `{r.get('sandwich_count', 'N/A')}`",
         f"• MEV risk: `{r.get('mev_risk', 'N/A')}`", f"",
-        f"━━━ 🤖 ANALYSIS ━━━",
-        f"{r.get('ai_summary', 'No summary available.')}", f"",
-        f"_Powered by Chain Sentinel • $CS_"
-    ])
+        f"━━━ 👨‍💻 DEV HISTORY ━━━",
+        f"• Deployer: {dev_short}",
+        f"• Launches (60d): `{token_count}` ({dead_count} dead)",
+        f"• Biggest MC: `{fmt_mc(biggest_mc)}`",
+        f"• Dev rating: {dev_risk}",
+    ]
+
+    if token_lines:
+        lines.append(f"• Top tokens:")
+        for tl in token_lines[:3]:
+            lines.append(f"  {tl}")
+
+    lines += [
+        f"", f"━━━ 🤖 ANALYSIS ━━━",
+        f"{r.get('ai_summary', '')}",
+        f"_{dev_summary}_",
+        f"", f"_Powered by Chain Sentinel • $CS_"
+    ]
+
+    return "\n".join(lines)
 
 
 @require_auth
@@ -234,6 +273,11 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if query.data.startswith("scan:"):
+        ca = query.data.split("scan:")[1]
+        await query.answer()
+        await run_scan(query, context, ca)
+        return
     if query.data.startswith("watch:"):
         ca = query.data.split("watch:")[1]
         add_to_watchlist(str(query.from_user.id), ca)
@@ -252,6 +296,85 @@ async def watchlist_job(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Alert error: {e}")
 
 
+
+@require_auth
+async def dev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /dev <contract_address>\n\nExample: /dev 8JnBeGkvs1XGLquaLcrZ9i4UCPjiDa2fSR1uv6k8pump"
+        )
+        return
+    ca = context.args[0].strip()
+    msg = await update.message.reply_text(
+        f"🔎 Analysing dev history for `{ca[:8]}...{ca[-4:]}`\nThis takes ~15 seconds...",
+        parse_mode="Markdown"
+    )
+    try:
+        result = await get_dev_alpha(ca)
+
+        if result.get("error"):
+            await msg.edit_text(f"❌ {result['error']}", parse_mode="Markdown")
+            return
+
+        deployer = result.get("deployer", "Unknown")
+        token_count = result.get("token_count", 0)
+        risk = result.get("risk", "N/A")
+        risk_note = result.get("risk_note", "")
+        summary = result.get("summary", "")
+        token_lines = result.get("token_lines", [])
+        dead_count = result.get("dead_count", 0)
+        biggest = result.get("biggest_launch")
+
+        def fmt_mc(mc):
+            if not mc: return "N/A"
+            if mc >= 1_000_000: return f"${mc/1_000_000:.2f}M"
+            elif mc >= 1_000: return f"${mc/1_000:.1f}K"
+            else: return f"${mc:.0f}"
+
+        lines = [
+            f"👨‍💻 *DEV ALPHA REPORT*",
+            f"",
+            f"*Deployer:* `{deployer[:8]}...{deployer[-4:]}`",
+            f"[View on Solscan](https://solscan.io/account/{deployer})",
+            f"",
+            f"━━━ 📊 LAUNCH HISTORY (60 days) ━━━",
+            f"• Total launches: `{token_count}`",
+            f"• Dead/untraded: `{dead_count}`",
+            f"• Biggest MC: `{fmt_mc(result.get('biggest_mc', 0))}`",
+            f"",
+            f"━━━ ⚠️ DEV RISK ━━━",
+            f"• Rating: {risk}",
+            f"• Note: _{risk_note}_",
+            f"",
+        ]
+
+        if token_lines:
+            lines.append("━━━ 🪙 PREVIOUS TOKENS (top 5) ━━━")
+            lines.extend(token_lines)
+            lines.append("")
+
+        lines.append("━━━ 🤖 SUMMARY ━━━")
+        lines.append(summary)
+        lines.append("")
+        lines.append("_Powered by Chain Sentinel • $CS_")
+
+        keyboard = [[
+            InlineKeyboardButton("🔍 Full Scan", callback_data=f"scan:{ca}"),
+            InlineKeyboardButton("👁 Solscan", url=f"https://solscan.io/account/{deployer}")
+        ]]
+
+        await msg.edit_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True
+        )
+
+    except Exception as e:
+        logger.error(f"Dev alpha error: {e}")
+        await msg.edit_text("❌ Dev analysis failed. Try again in a moment.", parse_mode="Markdown")
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -260,6 +383,7 @@ def main():
     app.add_handler(CommandHandler("watch", watch_cmd))
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
+    app.add_handler(CommandHandler("dev", dev_cmd))
     app.add_handler(CommandHandler("genlink", genlink_cmd))
     app.add_handler(CommandHandler("invites", invites_cmd))
     app.add_handler(CommandHandler("adduser", adduser_cmd))
