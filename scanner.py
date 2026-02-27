@@ -523,157 +523,130 @@ async def get_deployer(session: aiohttp.ClientSession, ca: str) -> str:
 async def get_deployed_tokens(session: aiohttp.ClientSession, deployer: str) -> list:
     import logging, time
     logger = logging.getLogger(__name__)
-    TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-    TOKEN_2022    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
     cutoff = time.time() - (60 * 86400)
+    seen = set()
+    token_mints = []
 
+    # ── Strategy 1: DexScreener search by deployer ────────────────────────────
+    # This is the most reliable — DexScreener indexes pump.fun launches
     try:
-        # ── Strategy 1: Helius enhanced API (parsed transactions) ──
-        seen = set()
-        token_mints = []
-
-        # Try multiple pages to get enough history
-        before = None
-        for page in range(5):  # up to 500 txs
-            url = f"{HELIUS_API}/addresses/{deployer}/transactions?api-key={HELIUS_API_KEY}&limit=100"
-            if before:
-                url += f"&before={before}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                if resp.status != 200:
-                    break
-                txs = await resp.json()
-
-            if not isinstance(txs, list) or not txs:
-                break
-
-            oldest_ts = None
-            for tx in txs:
-                ts = tx.get("timestamp", 0)
-                if oldest_ts is None or ts < oldest_ts:
-                    oldest_ts = ts
-
-                # Skip if older than 60 days
-                if ts < cutoff:
-                    continue
-
-                tx_type = tx.get("type", "")
-
-                # Method A: Helius marks these as TOKEN_MINT or CREATE
-                if tx_type in ("TOKEN_MINT", "CREATE", "INIT_MINT", "EXECUTE"):
-                    for transfer in tx.get("tokenTransfers", []):
-                        mint = transfer.get("mint", "")
-                        from_addr = transfer.get("fromUserAccount", "")
-                        # Only count if deployer is the source (minting)
-                        if mint and mint not in seen and (from_addr == deployer or from_addr == ""):
-                            seen.add(mint)
-                            token_mints.append({"mint": mint, "timestamp": ts})
-
-                # Method B: scan ALL token transfers regardless of type
-                for transfer in tx.get("tokenTransfers", []):
-                    mint = transfer.get("mint", "")
-                    from_addr = transfer.get("fromUserAccount", "")
-                    to_addr   = transfer.get("toUserAccount", "")
-                    # A mint event has empty fromUserAccount (tokens created from nothing)
-                    if mint and mint not in seen and from_addr == "" and to_addr == deployer:
+        url = f"https://api.dexscreener.com/latest/dex/search?q={deployer}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for pair in data.get("pairs", []) or []:
+                    if pair.get("chainId") != "solana":
+                        continue
+                    mint = pair.get("baseToken", {}).get("address", "")
+                    # Use pair creation time if available
+                    created_at = pair.get("pairCreatedAt", 0)
+                    ts = int(created_at / 1000) if created_at > 1e10 else int(created_at)
+                    if mint and mint not in seen:
                         seen.add(mint)
                         token_mints.append({"mint": mint, "timestamp": ts})
+        logger.info(f"[DEV] DexScreener search found {len(token_mints)} tokens")
+    except Exception as e:
+        logger.warning(f"[DEV] DexScreener search failed: {e}")
 
-                # Method C: scan instructions for InitializeMint
-                for ix in tx.get("instructions", []):
-                    prog = ix.get("programId", "")
-                    if prog not in (TOKEN_PROGRAM, TOKEN_2022):
-                        continue
-                    parsed = ix.get("parsed", {})
-                    ix_type = parsed.get("type", "") if isinstance(parsed, dict) else ""
-                    if "initializeMint" in ix_type.lower():
-                        info = parsed.get("info", {}) if isinstance(parsed, dict) else {}
-                        mint = info.get("mint", "")
+    # ── Strategy 2: Pump.fun API — most pump.fun launches are indexed here ────
+    try:
+        pump_url = f"https://frontend-api.pump.fun/coins/user-created-coins/{deployer}?offset=0&limit=50&includeNsfw=true"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(pump_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status == 200:
+                coins = await resp.json()
+                if isinstance(coins, list):
+                    for coin in coins:
+                        mint = coin.get("mint", "")
+                        created_ts = coin.get("created_timestamp", 0)
+                        ts = int(created_ts / 1000) if created_ts > 1e10 else int(created_ts)
                         if mint and mint not in seen:
                             seen.add(mint)
                             token_mints.append({"mint": mint, "timestamp": ts})
-
-                # Method D: check inner instructions too
-                for inner in tx.get("innerInstructions", []):
-                    for ix in inner.get("instructions", []):
-                        prog = ix.get("programId", "")
-                        if prog not in (TOKEN_PROGRAM, TOKEN_2022):
-                            continue
-                        parsed = ix.get("parsed", {})
-                        ix_type = parsed.get("type", "") if isinstance(parsed, dict) else ""
-                        if "initializeMint" in ix_type.lower():
-                            info = parsed.get("info", {}) if isinstance(parsed, dict) else {}
-                            mint = info.get("mint", "")
-                            if mint and mint not in seen:
-                                seen.add(mint)
-                                token_mints.append({"mint": mint, "timestamp": ts})
-
-            # Stop paginating if we've gone past 60 days
-            if oldest_ts and oldest_ts < cutoff:
-                break
-            # Set cursor for next page
-            before = txs[-1].get("signature") if txs else None
-            if not before:
-                break
-
-        logger.info(f"[DEV] Strategy 1 found {len(token_mints)} mints")
-
-        # ── Strategy 2: Solscan API as fallback if we found nothing ──
-        if not token_mints:
-            logger.info("[DEV] Trying Solscan fallback...")
-            try:
-                solscan_url = f"https://pro-api.solscan.io/v2.0/account/token-accounts?address={deployer}&type=token&page=1&page_size=40"
-                headers = {"token": os.environ.get("SOLSCAN_API_KEY", "")}
-                async with session.get(solscan_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for item in data.get("data", []):
-                            mint = item.get("tokenAddress", "")
-                            ts   = item.get("blockTime", 0)
-                            if mint and mint not in seen and ts >= cutoff:
-                                seen.add(mint)
-                                token_mints.append({"mint": mint, "timestamp": ts})
-                        logger.info(f"[DEV] Solscan fallback found {len(token_mints)} tokens")
-            except Exception as e2:
-                logger.warning(f"[DEV] Solscan fallback failed: {e2}")
-
-        # ── Strategy 3: Use DexScreener directly on deployer ──
-        if not token_mints:
-            logger.info("[DEV] Trying DexScreener search fallback...")
-            try:
-                dex_url = f"https://api.dexscreener.com/latest/dex/search?q={deployer}"
-                async with session.get(dex_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for pair in data.get("pairs", []) or []:
-                            if pair.get("chainId") != "solana":
-                                continue
-                            mint = pair.get("baseToken", {}).get("address", "")
-                            if mint and mint not in seen:
-                                seen.add(mint)
-                                token_mints.append({"mint": mint, "timestamp": int(time.time())})
-                        logger.info(f"[DEV] DexScreener fallback found {len(token_mints)} tokens")
-            except Exception as e3:
-                logger.warning(f"[DEV] DexScreener fallback failed: {e3}")
-
-        logger.info(f"[DEV] Total unique mints found: {len(token_mints)}")
-        return token_mints[:25]
-
+                    logger.info(f"[DEV] Pump.fun API total now: {len(token_mints)} tokens")
     except Exception as e:
-        logging.getLogger(__name__).error(f"[DEV] get_deployed_tokens error: {e}", exc_info=True)
-        return []
+        logger.warning(f"[DEV] Pump.fun API failed: {e}")
 
+    # ── Strategy 3: Helius transaction scan as extra coverage ────────────────
+    if len(token_mints) < 3:
+        try:
+            PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+            TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
-# ── Step 3: Enrich with DexScreener ──────────────────────────────────────────
+            before = None
+            for page in range(3):
+                url = f"{HELIUS_API}/addresses/{deployer}/transactions?api-key={HELIUS_API_KEY}&limit=100"
+                if before:
+                    url += f"&before={before}"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                    if resp.status != 200:
+                        break
+                    txs = await resp.json()
+
+                if not isinstance(txs, list) or not txs:
+                    break
+
+                oldest_ts = None
+                for tx in txs:
+                    ts = tx.get("timestamp", 0)
+                    if oldest_ts is None or ts < oldest_ts:
+                        oldest_ts = ts
+
+                    # Check token transfers — mint events have empty fromUserAccount
+                    for transfer in tx.get("tokenTransfers", []):
+                        mint = transfer.get("mint", "")
+                        from_addr = transfer.get("fromUserAccount", "")
+                        to_addr = transfer.get("toUserAccount", "")
+                        if mint and mint not in seen and from_addr == "":
+                            seen.add(mint)
+                            token_mints.append({"mint": mint, "timestamp": ts})
+
+                    # Check instructions for pump.fun create or token initialize
+                    for ix in tx.get("instructions", []):
+                        prog = ix.get("programId", "")
+                        if prog == PUMP_PROGRAM:
+                            accounts = ix.get("accounts", [])
+                            if accounts:
+                                mint = accounts[0]
+                                if mint and mint not in seen and len(mint) > 30:
+                                    seen.add(mint)
+                                    token_mints.append({"mint": mint, "timestamp": ts})
+
+                if oldest_ts and oldest_ts < cutoff:
+                    break
+                before = txs[-1].get("signature") if txs else None
+                if not before:
+                    break
+
+            logger.info(f"[DEV] After Helius scan total: {len(token_mints)} tokens")
+        except Exception as e:
+            logger.warning(f"[DEV] Helius scan failed: {e}")
+
+    # Filter to 60 days and deduplicate
+    now = time.time()
+    filtered = []
+    final_seen = set()
+    for t in token_mints:
+        mint = t["mint"]
+        ts = t["timestamp"]
+        # Include if within 60 days OR if timestamp is 0 (unknown, include anyway)
+        if mint not in final_seen and (ts == 0 or ts >= cutoff):
+            final_seen.add(mint)
+            filtered.append(t)
+
+    logger.info(f"[DEV] Final filtered tokens: {len(filtered)}")
+    return filtered[:25]
+
+# ── Step 3: Enrich with DexScreener + Pump.fun ───────────────────────────────
 async def enrich_with_dexscreener(session: aiohttp.ClientSession, tokens: list) -> list:
     import logging
     logger = logging.getLogger(__name__)
-    enriched = []
 
-    # DexScreener allows batch of up to 30 addresses
     mints = [t["mint"] for t in tokens]
-    chunks = [mints[i:i+29] for i in range(0, len(mints), 29)]
-
     dex_data = {}
+
+    # Batch lookup on DexScreener (up to 29 per request)
+    chunks = [mints[i:i+29] for i in range(0, len(mints), 29)]
     for chunk in chunks:
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
@@ -684,24 +657,56 @@ async def enrich_with_dexscreener(session: aiohttp.ClientSession, tokens: list) 
                         mint = pair.get("baseToken", {}).get("address", "")
                         if mint and mint not in dex_data:
                             dex_data[mint] = pair
-            await asyncio.sleep(0.5)  # rate limit
+            await asyncio.sleep(0.3)
         except Exception as e:
-            logger.error(f"[DEV] dexscreener error: {e}")
+            logger.warning(f"[DEV] DexScreener batch error: {e}")
 
+    # For tokens not found on DexScreener, try pump.fun API
+    missing = [m for m in mints if m not in dex_data]
+    pump_data = {}
+    for mint in missing[:10]:  # limit to avoid rate limits
+        try:
+            url = f"https://frontend-api.pump.fun/coins/{mint}"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    coin = await resp.json()
+                    if isinstance(coin, dict):
+                        pump_data[mint] = coin
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+    logger.info(f"[DEV] DexScreener found {len(dex_data)}, pump.fun found {len(pump_data)}")
+
+    enriched = []
     for token in tokens:
         mint = token["mint"]
-        pair = dex_data.get(mint, {})
-        name = pair.get("baseToken", {}).get("name", "Unknown")
-        symbol = pair.get("baseToken", {}).get("symbol", "???")
-        mc = pair.get("fdv") or pair.get("marketCap") or 0
-        price_usd = pair.get("priceUsd", "0")
-        volume_24h = pair.get("volume", {}).get("h24", 0)
-        price_change = pair.get("priceChange", {}).get("h24", 0)
+        pair = dex_data.get(mint)
+        pump = pump_data.get(mint)
 
-        try:
-            mc = float(mc)
-        except Exception:
+        if pair:
+            name = pair.get("baseToken", {}).get("name", "Unknown")
+            symbol = pair.get("baseToken", {}).get("symbol", "???")
+            mc = float(pair.get("fdv") or pair.get("marketCap") or 0)
+            price_usd = pair.get("priceUsd", "0")
+            volume_24h = pair.get("volume", {}).get("h24", 0)
+            on_dex = True
+        elif pump:
+            name = pump.get("name", "Unknown")
+            symbol = pump.get("symbol", "???")
+            # pump.fun gives market_cap in SOL sometimes, use usd_market_cap
+            mc = float(pump.get("usd_market_cap") or pump.get("market_cap") or 0)
+            price_usd = str(pump.get("price", "0"))
+            volume_24h = 0
+            on_dex = mc > 0
+        else:
+            name = "Unknown"
+            symbol = "???"
             mc = 0
+            price_usd = "0"
+            volume_24h = 0
+            on_dex = False
 
         enriched.append({
             "mint": mint,
@@ -710,12 +715,10 @@ async def enrich_with_dexscreener(session: aiohttp.ClientSession, tokens: list) 
             "market_cap": mc,
             "price_usd": price_usd,
             "volume_24h": volume_24h,
-            "price_change_24h": price_change,
             "timestamp": token.get("timestamp", 0),
-            "on_dex": bool(pair),
+            "on_dex": on_dex,
         })
 
-    # Sort by market cap descending
     enriched.sort(key=lambda x: x["market_cap"], reverse=True)
     return enriched
 
@@ -783,7 +786,3 @@ def build_dev_report(deployer: str, current_ca: str, tokens: list) -> dict:
         "risk_note": risk_note,
         "summary": summary,
     }
-
-
-
-
