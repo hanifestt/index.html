@@ -49,10 +49,13 @@ async def run_monitor(bot: Bot):
             await _monitor_loop(bot)
         except asyncio.CancelledError:
             logger.info("[MONITOR] Monitor cancelled.")
-            break
+            return
         except Exception as e:
             logger.error(f"[MONITOR] Connection error: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return
 
 
 async def _monitor_loop(bot: Bot):
@@ -118,7 +121,7 @@ async def _handle_message(raw_msg: str, session: aiohttp.ClientSession, bot: Bot
 
     # Run full pipeline with speed target of 500ms
     start_time = time.time()
-    asyncio.create_task(
+    asyncio.ensure_future(
         _process_launch(sig, session, bot, start_time)
     )
 
@@ -128,47 +131,43 @@ async def _handle_message(raw_msg: str, session: aiohttp.ClientSession, bot: Bot
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _process_launch(sig: str, session: aiohttp.ClientSession, bot: Bot, start_time: float):
+    # Use a fresh session per launch to avoid closed session errors
     try:
-        # Step 1: Get transaction details to find the mint address
-        mint, metadata_uri, creator = await get_launch_details(session, sig)
-        if not mint:
-            return
+        async with aiohttp.ClientSession() as local_session:
+            mint, metadata_uri, creator = await get_launch_details(local_session, sig)
+            if not mint:
+                return
 
-        # Deduplicate
-        if mint in _seen_mints:
-            return
-        _seen_mints.add(mint)
+            if mint in _seen_mints:
+                return
+            _seen_mints.add(mint)
 
-        logger.info(f"[MONITOR] New token: {mint[:8]}... by {str(creator)[:8]}...")
+            logger.info(f"[MONITOR] New token: {mint[:8]}... by {str(creator)[:8]}...")
 
-        # Step 2: Fetch metadata (name, symbol, socials) — run fast
-        meta_task = asyncio.create_task(fetch_metadata(session, mint, metadata_uri))
+            try:
+                meta, dev_data = await asyncio.wait_for(
+                    asyncio.gather(
+                        fetch_metadata(local_session, mint, metadata_uri),
+                        get_dev_alpha_for_monitor(local_session, creator),
+                    ),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[MONITOR] Timeout enriching {mint[:8]}...")
+                return
 
-        # Step 3: Dev alpha — run in parallel
-        dev_task  = asyncio.create_task(get_dev_alpha_for_monitor(session, creator))
+            has_twitter  = bool(meta.get("twitter"))
+            has_telegram = bool(meta.get("telegram"))
 
-        # Wait for both with timeout to stay within ~500ms budget
-        try:
-            meta, dev_data = await asyncio.wait_for(
-                asyncio.gather(meta_task, dev_task),
-                timeout=4.0  # allow 4s total for enrichment
-            )
-        except asyncio.TimeoutError:
-            meta     = await meta_task if not meta_task.done() else meta_task.result()
-            dev_data = {}
+            if not (has_twitter or has_telegram):
+                logger.info(f"[MONITOR] {mint[:8]}... skipped — no socials")
+                return
 
-        # Filter 1: Socials check
-        has_twitter  = bool(meta.get("twitter"))
-        has_telegram = bool(meta.get("telegram"))
+            elapsed = round((time.time() - start_time) * 1000)
+            await send_launch_alert(bot, mint, meta, dev_data, creator, sig, elapsed, has_twitter, has_telegram)
 
-        if not (has_twitter or has_telegram):
-            logger.info(f"[MONITOR] {mint[:8]}... skipped — no socials")
-            return
-
-        # Build and send alert
-        elapsed = round((time.time() - start_time) * 1000)
-        await send_launch_alert(bot, mint, meta, dev_data, creator, sig, elapsed, has_twitter, has_telegram)
-
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         logger.error(f"[MONITOR] _process_launch error: {e}", exc_info=True)
 
