@@ -19,16 +19,20 @@ BIRDEYE_API = "https://public-api.birdeye.so"
 # ── Main entry ────────────────────────────────────────────────────────────────
 async def scan_token(ca: str) -> dict:
     async with aiohttp.ClientSession() as session:
-        wallet_data, lp_data, supply_data, mev_data, dev_data = await asyncio.gather(
+        wallet_data, lp_data, supply_data, mev_data, dev_data, token_meta = await asyncio.gather(
             scan_wallets(session, ca),
             scan_lp(session, ca),
             scan_supply(session, ca),
             scan_mev(session, ca),
             get_dev_alpha(ca),
+            get_token_meta(session, ca),
         )
 
     combined = {**wallet_data, **lp_data, **supply_data, **mev_data}
     combined["dev"] = dev_data
+    combined["token_name"]   = token_meta.get("name", "Unknown")
+    combined["token_symbol"] = token_meta.get("symbol", "???")
+    combined["token_image"]  = token_meta.get("image", "")
 
     ws = score_wallets(wallet_data)
     ls = score_lp(lp_data)
@@ -146,6 +150,71 @@ async def scan_lp(session: aiohttp.ClientSession, ca: str) -> dict:
 
 def _lp_defaults():
     return {"lp_locked": "N/A", "lp_lock_duration": "N/A", "lp_liquidity_usd": 0, "volume_24h": 0, "price": 0, "market_cap": 0}
+
+# ── Token metadata — name, symbol ─────────────────────────────────────────────
+async def get_token_meta(session: aiohttp.ClientSession, ca: str) -> dict:
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Source 1: Pump.fun (fastest for pump.fun tokens)
+    try:
+        url = f"https://frontend-api.pump.fun/coins/{ca}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, dict) and data.get("name"):
+                    logger.info(f"[META] Found on pump.fun: {data.get('name')}")
+                    return {
+                        "name": data.get("name", "Unknown"),
+                        "symbol": data.get("symbol", "???"),
+                        "image": data.get("image_uri", ""),
+                    }
+    except Exception:
+        pass
+
+    # Source 2: DexScreener
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                pairs = data.get("pairs", []) or []
+                if pairs:
+                    token = pairs[0].get("baseToken", {})
+                    if token.get("name"):
+                        logger.info(f"[META] Found on DexScreener: {token.get('name')}")
+                        return {
+                            "name": token.get("name", "Unknown"),
+                            "symbol": token.get("symbol", "???"),
+                            "image": "",
+                        }
+    except Exception:
+        pass
+
+    # Source 3: Helius token metadata
+    try:
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAsset",
+            "params": {"id": ca}
+        }
+        async with session.post(HELIUS_RPC, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                result = data.get("result", {})
+                content_data = result.get("content", {})
+                metadata = content_data.get("metadata", {})
+                name = metadata.get("name") or result.get("content", {}).get("json_uri", "")
+                symbol = metadata.get("symbol", "???")
+                image = content_data.get("links", {}).get("image", "")
+                if name:
+                    logger.info(f"[META] Found via Helius getAsset: {name}")
+                    return {"name": name, "symbol": symbol, "image": image}
+    except Exception:
+        pass
+
+    return {"name": "Unknown", "symbol": "???", "image": ""}
 
 
 # ── Supply concentration — Helius RPC getLargestAccounts ─────────────────────
