@@ -151,7 +151,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, ca: str):
     msg = await update.message.reply_text(
-        f"🔍 Scanning `{ca[:8]}...{ca[-4:]}`\nThis takes ~10 seconds...",
+        f"🔍 Scanning `{ca[:8]}...{ca[-4:]}`\nFetching token data, please wait...",
         parse_mode="Markdown"
     )
     try:
@@ -194,8 +194,13 @@ def format_report(ca: str, r: dict) -> str:
     token_lines = dev.get("token_lines", [])
     dev_summary = dev.get("summary", "No dev history found.")
 
+    name   = r.get("token_name", "Unknown")
+    symbol = r.get("token_symbol", "???")
+    header = f"*{name}* (${symbol})" if name != "Unknown" else f"`{ca}`"
+
     lines = [
         f"👁 *CHAIN SENTINEL REPORT*",
+        f"{header}",
         f"`{ca}`", f"",
         f"*Risk Score: {score}/100 — {verdict}*", f"",
         f"━━━ 💼 WALLET ANALYSIS ━━━",
