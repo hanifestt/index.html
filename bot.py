@@ -11,6 +11,9 @@ from scanner import scan_token, get_dev_alpha
 from smartmoney import find_smart_money, format_smart_money_report
 from clusters import find_wallet_clusters, format_cluster_report
 from monitor import run_monitor, add_monitor_user, remove_monitor_user, is_monitoring, get_monitor_count
+from evm_scanner import scan_evm_token
+from evm_monitor import run_evm_monitor, add_evm_monitor_user, remove_evm_monitor_user, is_evm_monitoring
+from chain_detector import detect_chain, chain_emoji, chain_name, get_explorer_url, get_dex_url, is_evm_address
 from watchlist import add_to_watchlist, remove_from_watchlist, get_watchlist, check_watchlist_alerts
 from invites import generate_invite, use_invite, is_authorized, authorize_user, list_invites
 
@@ -150,28 +153,135 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if 32 <= len(text) <= 44 and text.isalnum():
+    from chain_detector import is_evm_address, is_solana_address
+    if is_evm_address(text) or (32 <= len(text) <= 44 and is_solana_address(text)):
         await run_scan(update, context, text)
     else:
-        await update.message.reply_text("Send me a Solana contract address to scan, or use /help.")
+        await update.message.reply_text("Send me a Solana, Base, or Ethereum contract address to scan, or use /help.")
 
 
 async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, ca: str):
-    msg = await update.message.reply_text(
-        f"🔍 Scanning `{ca[:8]}...{ca[-4:]}`\nFetching token data, please wait...",
+    msg_obj = update.message if update.message else update.callback_query.message
+    msg = await msg_obj.reply_text(
+        f"🔍 Detecting chain for `{ca[:8]}...{ca[-4:]}`...",
         parse_mode="Markdown"
     )
     try:
-        result = await scan_token(ca)
-        text = format_report(ca, result)
-        keyboard = [[
-            InlineKeyboardButton("👁 Watch Token", callback_data=f"watch:{ca}"),
-            InlineKeyboardButton("🔗 Pump.fun", url=f"https://pump.fun/coin/{ca}")
-        ]]
-        await msg.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        chain = await detect_chain(ca)
+        cemoji = chain_emoji(chain)
+        cname  = chain_name(chain)
+
+        await msg.edit_text(
+            f"{cemoji} Scanning `{ca[:8]}...{ca[-4:]}` on *{cname}*\nFetching token data...",
+            parse_mode="Markdown"
+        )
+
+        if chain == "solana":
+            result  = await scan_token(ca)
+            text    = format_report(ca, result)
+            buttons = [[
+                InlineKeyboardButton("👁 Watch Token", callback_data=f"watch:{ca}"),
+                InlineKeyboardButton("🔗 Pump.fun", url=get_dex_url(ca, chain))
+            ]]
+        elif chain in ("base", "ethereum"):
+            result  = await scan_evm_token(ca, chain)
+            text    = format_evm_report(ca, chain, result)
+            buttons = [[
+                InlineKeyboardButton("👁 Watch Token", callback_data=f"watch:{ca}"),
+                InlineKeyboardButton("🛒 Buy", url=get_dex_url(ca, chain)),
+            ],[
+                InlineKeyboardButton(f"{cemoji} Explorer", url=get_explorer_url(ca, chain)),
+                InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/{chain}/{ca}"),
+            ]]
+        else:
+            await msg.edit_text(
+                "❌ Unknown chain. Send a valid Solana, Base, or Ethereum contract address.",
+                parse_mode="Markdown"
+            )
+            return
+
+        await msg.edit_text(text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons), disable_web_page_preview=True)
     except Exception as e:
-        logger.error(f"Scan error: {e}")
-        await msg.edit_text(f"❌ Scan failed for `{ca[:8]}...`\n\nMake sure it's a valid Solana CA.", parse_mode="Markdown")
+        logger.error(f"Scan error: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Scan failed for `{ca[:8]}...`\nCheck the CA and try again.", parse_mode="Markdown")
+
+
+def format_evm_report(ca: str, chain: str, r: dict) -> str:
+    score  = r.get("risk_score", 0)
+    cemoji = chain_emoji(chain)
+    cname  = chain_name(chain)
+
+    if score <= 30:   verdict = "🟢 LOW RISK"
+    elif score <= 60: verdict = "🟡 MEDIUM RISK"
+    elif score <= 80: verdict = "🟠 HIGH RISK"
+    else:             verdict = "🔴 CRITICAL RISK"
+
+    def fmt_mc(mc):
+        try:
+            mc = float(mc)
+            if mc >= 1_000_000: return f"${mc/1_000_000:.2f}M"
+            elif mc >= 1_000:   return f"${mc/1_000:.1f}K"
+            else:               return f"${mc:.0f}"
+        except: return "N/A"
+
+    dev         = r.get("dev", {})
+    deployer    = dev.get("deployer", "N/A") or "N/A"
+    dev_short   = f"`{deployer[:8]}...{deployer[-4:]}`" if len(deployer) > 12 else f"`{deployer}`"
+    dev_risk    = dev.get("risk", "N/A")
+    token_count = dev.get("token_count", 0)
+    dead_count  = dev.get("dead_count", 0)
+    biggest_mc  = dev.get("biggest_mc", 0)
+    token_lines = dev.get("token_lines", [])
+    dev_summary = dev.get("summary", "No dev history found.")
+    exp_url     = get_explorer_url(deployer, chain)
+
+    name   = r.get("token_name", "Unknown")
+    symbol = r.get("token_symbol", "???")
+    header = f"*{name}* (${symbol})" if name != "Unknown" else f"`{ca}`"
+
+    lines = [
+        f"{cemoji} *CHAIN SENTINEL REPORT* — {cname}",
+        f"{header}",
+        f"`{ca}`", f"",
+        f"*Risk Score: {score}/100 — {verdict}*", f"",
+        f"━━━ 💼 WALLET ACTIVITY ━━━",
+        f"• Unique wallets (100 txs): `{r.get('wallet_count', 'N/A')}`",
+        f"• Fresh wallets (<24h): `{r.get('fresh_wallet_pct', 'N/A')}%`",
+        f"• Cluster activity: `{r.get('cluster_pct', 'N/A')}%`",
+        f"• Holder risk: `{r.get('holder_risk', 'N/A')}`", f"",
+        f"━━━ 💧 LIQUIDITY ━━━",
+        f"• Status: `{r.get('lp_locked', 'N/A')}`",
+        f"• Market Cap: `{fmt_mc(r.get('market_cap', 0))}`",
+        f"• Volume 24h: `{fmt_mc(r.get('volume_24h', 0))}`",
+        f"• LP risk: `{r.get('lp_risk', 'N/A')}`", f"",
+        f"━━━ 📊 SUPPLY CONCENTRATION ━━━",
+        f"• Holder count: `{r.get('holder_count', 'N/A')}`",
+        f"• Top holder: `{r.get('top1_pct', 'N/A')}%`",
+        f"• Top 10 holders: `{r.get('top10_pct', 'N/A')}%`",
+        f"• Gini: `{r.get('gini', 'N/A')}`",
+        f"• Supply risk: `{r.get('supply_risk', 'N/A')}`", f"",
+        f"━━━ 👨‍💻 DEV HISTORY ━━━",
+        f"• Deployer: {dev_short}",
+        f"  [View on Explorer]({exp_url})",
+        f"• Deployments (60d): `{token_count}` ({dead_count} dead)",
+        f"• Biggest MC: `{fmt_mc(biggest_mc)}`",
+        f"• Dev rating: {dev_risk}",
+    ]
+
+    if token_lines:
+        lines.append("• Top tokens:")
+        for tl in token_lines[:3]:
+            lines.append(f"  {tl}")
+
+    lines += [
+        f"", f"━━━ 🤖 ANALYSIS ━━━",
+        f"{r.get('ai_summary', '')}",
+        f"_{dev_summary}_",
+        f"", f"_Powered by Chain Sentinel • $CS_"
+    ]
+    return "\n".join(lines)
+
 
 
 def format_report(ca: str, r: dict) -> str:
@@ -453,12 +563,37 @@ async def cluster_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        result = await find_wallet_clusters(ca)
-        report = format_cluster_report(result)
+        chain_type = detect_chain(ca)
+        if chain_type == "evm":
+            async with __import__("aiohttp").ClientSession() as session:
+                from evm_scanner import detect_evm_chain
+                chain = await detect_evm_chain(session, ca)
+            result = await get_evm_clusters(ca, chain)
+            chain_name = "Base" if chain == "base" else "Ethereum"
+            if result.get("error"):
+                report = f"❌ {result['error']}"
+            else:
+                score = result.get("cabal_probability", 0)
+                clusters = result.get("clusters", [])
+                lines = [
+                    f"🕸 *WALLET CLUSTER REPORT* — {chain_name}",
+                    f"`{ca}`", f"",
+                    f"*Cabal Probability: {score}/100*", f"",
+                    f"• Holders scanned: `{result.get('total_holders_scanned', 0)}`",
+                    f"• Clusters found: `{len(clusters)}`", f"",
+                ]
+                for i, c in enumerate(clusters[:5], 1):
+                    lines += [
+                        f"*Cluster #{i}* — Funder: `{c['funder'][:8]}...`",
+                        f"Funded {c['count']} wallets", f"",
+                    ]
+                report = "\n".join(lines)
+        else:
+            result = await find_wallet_clusters(ca)
+            report = format_cluster_report(result)
 
         if len(report) > 4000:
             report = report[:3900] + "\n\n_Report truncated._"
-
         await msg.edit_text(report, parse_mode="Markdown", disable_web_page_preview=True)
 
     except Exception as e:
@@ -477,11 +612,14 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     add_monitor_user(user_id)
+    add_evm_monitor_user(user_id)
     await update.message.reply_text(
         "✅ *Live Monitor ON*\n\n"
-        "You will now receive instant alerts for new pump.fun launches that have:\n"
-        "• Twitter or Telegram socials\n"
-        "• 🔥 Bullish dev (prev launch >$500K MC)\n\n"
+        "You will now receive instant alerts for:\n"
+        "• 🟣 Solana — pump.fun new launches\n"
+        "• 🔵 Base — Uniswap new pairs\n"
+        "• ⟠ Ethereum — Uniswap new pairs\n\n"
+        "Filter: must have socials + optional bullish dev\n\n"
         "Use /unmonitor to stop alerts.",
         parse_mode="Markdown"
     )
@@ -490,7 +628,8 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unmonitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     remove_monitor_user(user_id)
-    await update.message.reply_text("🔕 Live monitor disabled. Use /monitor to re-enable.")
+    remove_evm_monitor_user(user_id)
+    await update.message.reply_text("🔕 Live monitor disabled for all chains. Use /monitor to re-enable.")
 
 async def monitorstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -529,7 +668,8 @@ def main():
     async def post_init(application):
         bot = application.bot
         asyncio.create_task(run_monitor(bot))
-        logger.info("[MONITOR] Background monitor started.")
+        asyncio.create_task(run_evm_monitor(bot))
+        logger.info("[MONITOR] Solana + ETH + Base monitors started.")
 
     app.post_init = post_init
     app.run_polling()
