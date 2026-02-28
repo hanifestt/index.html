@@ -8,6 +8,7 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 from scanner import scan_token, get_dev_alpha
+from smartmoney import find_smart_money, format_smart_money_report
 from watchlist import add_to_watchlist, remove_from_watchlist, get_watchlist, check_watchlist_alerts
 from invites import generate_invite, use_invite, is_authorized, authorize_user, list_invites
 
@@ -75,6 +76,7 @@ async def send_welcome(update: Update, name: str):
         "*Commands:*\n"
         "/scan `<CA>` — Full risk scan\n"
         "/dev `<CA>` — Dev history & alpha\n"
+        "/smartmoney `<CA1> <CA2>` — Find smart money wallets\n"
         "/watch `<CA>` — Add to watchlist\n"
         "/unwatch `<CA>` — Remove from watchlist\n"
         "/watchlist — View your watchlist\n\n"
@@ -380,6 +382,45 @@ async def dev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("❌ Dev analysis failed. Try again in a moment.", parse_mode="Markdown")
 
 
+@require_auth
+async def smartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "🧠 *Smart Money Finder*\n\n"
+            "Find wallets holding multiple successful tokens with high win rates.\n\n"
+            "Usage: `/smartmoney <CA1> <CA2> [CA3] [CA4] [CA5]`\n\n"
+            "Example: paste 2-5 contract addresses separated by spaces.\n"
+            "_Minimum 2 CAs required._",
+            parse_mode="Markdown"
+        )
+        return
+
+    mints = [a.strip() for a in context.args if len(a.strip()) >= 32]
+    if len(mints) < 2:
+        await update.message.reply_text("❌ Please provide at least 2 valid Solana contract addresses.")
+        return
+
+    msg = await update.message.reply_text(
+        f"🧠 Scanning smart money across {len(mints)} tokens...\n"
+        f"This takes 20-30 seconds...",
+        parse_mode="Markdown"
+    )
+
+    try:
+        result = await find_smart_money(mints, min_win_rate=0.55, min_pnl_sol=5.0)
+        report = format_smart_money_report(result)
+
+        # Telegram message limit is 4096 chars
+        if len(report) > 4000:
+            report = report[:3900] + "\n\n_Report truncated — too many results._"
+
+        await msg.edit_text(report, parse_mode="Markdown", disable_web_page_preview=True)
+
+    except Exception as e:
+        logger.error(f"Smart money error: {e}")
+        await msg.edit_text("❌ Smart money scan failed. Try again with different tokens.", parse_mode="Markdown")
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -389,6 +430,7 @@ def main():
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("dev", dev_cmd))
+    app.add_handler(CommandHandler("smartmoney", smartmoney_cmd))
     app.add_handler(CommandHandler("genlink", genlink_cmd))
     app.add_handler(CommandHandler("invites", invites_cmd))
     app.add_handler(CommandHandler("adduser", adduser_cmd))
